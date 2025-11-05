@@ -52,11 +52,19 @@ def generate_poll_question(topic: str, num_questions: int):
     if not client:
         raise Exception("API 클라이언트가 초기화되지 않았습니다. API 키 설정을 확인해주세요.")
         
-    system_prompt = "당신은 만13세 ~ 만18세 사용자들의 흥미와 관계를 증진시키는 투표 질문을 생성하는 전문가입니다. 한국어로 응답해야 하며, 결과는 반드시 제공된 JSON 스키마를 따라야 합니다."
+    # --- 시스템 프롬프트 강화: 청소년 안전 지침 추가 ---
+    system_prompt = (
+        "당신은 사용자들의 흥미와 관계를 증진시키는 투표 질문을 생성하는 전문가입니다. "
+        "응답은 반드시 한국어로 이루어져야 하며, 결과는 제공된 JSON 스키마를 따라야 합니다. "
+        "**절대로 술, 담배, 폭력, 성적인 내용, 비방, 욕설 등 청소년에게 부적절한 단어나 주제를 포함해서는 안 됩니다.** "
+        "안전하고 건전한 질문만을 생성하세요."
+    )
+    # --- 시스템 프롬프트 강화 끝 ---
+    
     user_query = f"""
     주제 '{topic}'에 맞춰 재미있고 친목을 위한 캐주얼한 투표 질문 {num_questions}개를 
-    '~한 사람?', '~하지 않은 사람?', 또는 '~할 것 같은 사람?' 형식의 구문으로만 만들어주세요. 
-    예를 들어 주제가 '점심 메뉴'라면 '오늘의 급식메뉴 항상 알고 있을 것 같은 사람?'처럼 구체적이어야 합니다.
+    '~한 친구?', '~하지 않은 친구?' 또는 '~할 것 같은 친구?' 형식의 패턴으로 만들어주세요. 
+    예를 들어 주제가 '점심 메뉴'라면 '오늘 급식 메뉴 알고 있을 것 같은 사람?'처럼 구체적이어야 합니다.
     
     Output must be JSON with keys:
     [
@@ -82,6 +90,7 @@ def generate_poll_question(topic: str, num_questions: int):
         
         match = re.search(r'\[.*\]', content, re.S)
         if not match:
+            # AI가 안전 지침을 따르느라 응답이 비어있을 수도 있습니다.
             raise ValueError(f"AI 응답에서 유효한 JSON을 찾을 수 없습니다: {content}")
         
         question_phrases = json.loads(match.group())

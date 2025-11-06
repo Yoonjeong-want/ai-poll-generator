@@ -1,0 +1,7 @@
+## Environment variables
+.env
+
+## Dependencies/Build outputs
+/venv pycache/*.pyc
+/dist
+/build

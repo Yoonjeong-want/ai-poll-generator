@@ -1,84 +1,183 @@
-import os
 import json
-import re
-from openai import OpenAI
-import streamlit as st 
-from dotenv import load_dotenv
+import time
+import random
+from typing import Dict, Any, List
 
-# --- 1. 환경 설정 및 API 클라이언트 ---
-
-API_KEY = None
-client = None
-
-# Streamlit Cloud 배포와 로컬 실행을 모두 지원하는 키 로딩 로직
+# --- Firebase Global Variables (Provided by Canvas Environment) ---
+# NOTE: These variables are typically used in client-side JS/React/Angular apps
+# For a backend utility like this, they serve mainly to acknowledge the environment.
+# They are not used in the core API call logic below but are included for context.
 try:
-    if "OPENAI_API_KEY" in st.secrets:
-        API_KEY = st.secrets["OPENAI_API_KEY"]
-except Exception:
-    pass
+    __app_id = __app_id # Provided by the execution environment
+    __firebase_config = __firebase_config # Provided by the execution environment
+    __initial_auth_token = __initial_auth_token # Provided by the execution environment
+except NameError:
+    # Default values for local testing outside the Canvas environment
+    __app_id = 'default-quiz-app'
+    __firebase_config = '{}'
+    __initial_auth_token = 'none'
 
-if not API_KEY:
-    load_dotenv()
-    API_KEY = os.getenv("OPENAI_API_KEY")
+# --- API Configuration ---
+# API key is implicitly handled by the execution environment when fetching.
+API_KEY = ""
+MODEL_NAME = "gemini-2.5-flash-preview-09-2025"
+API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={API_KEY}"
 
-if API_KEY:
-    client = OpenAI(api_key=API_KEY)
-
-
-# --- 2. 퀴즈 생성 함수 ---
-
-# 💡 cache_version 인자를 추가하여 app.py의 호출과 일치시킵니다.
-@st.cache_data(ttl="1d")
-def generate_reflection_quiz(quiz_id: str, cache_version: int = 1):
+def create_api_payload(system_prompt: str, user_query: str, schema: Dict[str, Any]) -> Dict[str, Any]:
     """
-    OpenAI GPT-4o-mini를 사용하여 청소년 대상 자아 발견 퀴즈 질문을 생성합니다.
+    Creates the JSON payload for the Gemini API call with structured output.
     """
-    
-    if not client:
-        raise Exception("API 클라이언트가 초기화되지 않았습니다. API 키 설정을 확인해주세요.")
+    return {
+        "contents": [{
+            "parts": [{"text": user_query}]
+        }],
+        "systemInstruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": schema
+        },
+        "tools": [{"google_search": {}}] # Use Google Search for grounding
+    }
 
-    # --- 시스템 프롬프트 강화: JSON 출력 및 청소년 지침 ---
+def get_reflection_quiz_schema() -> Dict[str, Any]:
+    """
+    Defines the strict JSON schema for the reflection quiz structure.
+    """
+    return {
+        "type": "OBJECT",
+        "properties": {
+            "title": {"type": "STRING", "description": "The title of the reflection quiz."},
+            "questions": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "id": {"type": "INTEGER", "description": "A unique question ID starting from 1."},
+                        "type": {"type": "STRING", "enum": ["multiple_choice", "short_answer"], "description": "The type of question."},
+                        "question_text": {"type": "STRING", "description": "The question content."},
+                        "options": {
+                            "type": "ARRAY",
+                            "items": {"type": "STRING"},
+                            "description": "Only for multiple_choice type. List of 3-5 possible answers. Empty list for short_answer."
+                        },
+                        "correct_answer": {"type": "STRING", "description": "The correct answer text (for MC) or a brief expected answer/key concept (for SA)."}
+                    },
+                    "required": ["id", "type", "question_text", "options", "correct_answer"]
+                },
+                "description": "A list of 5-7 questions covering the reflection topic."
+            }
+        },
+        "required": ["title", "questions"]
+    }
+
+def validate_quiz_data(data: Dict[str, Any]) -> bool:
+    """
+    Performs critical validation on the parsed quiz structure.
+    """
+    if not isinstance(data.get('title'), str) or not data.get('title'):
+        print("Validation Error: Quiz title is missing or invalid.")
+        return False
+
+    questions = data.get('questions')
+    if not isinstance(questions, list) or not questions:
+        print("Validation Error: Questions list is missing or invalid.")
+        return False
+
+    for q in questions:
+        if q.get('type') not in ['multiple_choice', 'short_answer']:
+            print(f"Validation Error: Invalid question type: {q.get('type')}")
+            return False
+
+        if q.get('type') == 'multiple_choice':
+            options = q.get('options')
+            if not isinstance(options, list) or not (3 <= len(options) <= 5):
+                print(f"Validation Error: Multiple choice question {q.get('id')} has invalid options count.")
+                return False
+
+    return True
+
+async def generate_reflection_quiz(topic: str) -> Dict[str, Any]:
+    """
+    Generates a structured reflection quiz on the given topic using the Gemini API.
+    Implements exponential backoff for retries.
+    """
+    print(f"Attempting to generate reflection quiz for topic: {topic}")
+
     system_prompt = (
-        "당신은 중고등학생을 위한 성격 유형 테스트(MBTI 스타일) 질문을 생성하는 전문가입니다. "
-        "질문은 반드시 한국어로, 청소년의 일상(학교, 친구, 숙제, 취미, 정서)에 밀접해야 하며, "
-        "성인 직장인과 관련된 주제(업무, 회사, 경력)는 엄격히 제외해야 합니다. "
-        "**절대로 술, 담배, 폭력, 성적인 내용, 비방, 욕설 등 청소년에게 부적절한 단어나 주제를 포함해서는 안 됩니다.** "
-        "응답은 반드시 5개의 JSON 배열로만 응답해야 합니다. 다른 텍스트는 절대 포함하지 마세요."
+        "You are an educational quiz generator. Your task is to create a structured "
+        "5-7 question reflection quiz based on the user's topic. "
+        "The quiz MUST strictly follow the provided JSON schema. "
+        "Include a mix of 'multiple_choice' (MC) and 'short_answer' (SA) questions. "
+        "MC options must be 3-5 choices. SA questions should test understanding and reflection."
     )
     
-    user_query = "현재의 심리 상태와 자기 이해를 돕기 위한 5가지 문항의 퀴즈를 생성해주세요. 각 문항은 A와 B 중 하나를 선택하는 형식이어야 합니다. JSON 형식은 다음과 같습니다: [{'id': 1, 'question': '...', 'choiceA': '...', 'choiceB': '...'}, ...]"
+    user_query = f"Generate a reflection quiz consisting of 5-7 questions about the following topic, using up-to-date information: {topic}"
+    schema = get_reflection_quiz_schema()
+    payload = create_api_payload(system_prompt, user_query, schema)
+    
+    max_retries = 3
+    initial_delay = 1 # seconds
 
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_query}
-            ],
-            temperature=0.7,
-            max_tokens=500,
-            response_format={"type": "json_object"}
-        )
-        
-        content = response.choices[0].message.content.strip()
-        
-        # AI 응답 텍스트에서 유효한 JSON 배열 [..]을 추출
-        match = re.search(r'\[.*\]', content, re.S)
-        if not match:
-            # 유효한 JSON 배열이 없는 경우 응답 전체를 JSON으로 파싱 시도
-            try:
-                parsed_json = json.loads(content)
-            except json.JSONDecodeError:
-                raise ValueError(f"AI 응답에서 유효한 JSON 배열을 찾을 수 없습니다: {content}")
-        else:
-            parsed_json = json.loads(match.group())
+    for attempt in range(max_retries):
+        try:
+            # 1. API Call
+            response = await fetch(API_URL, {
+                'method': 'POST',
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps(payload)
+            })
+            
+            # Raise an exception for bad status codes (e.g., 400s or 500s)
+            if not response.ok:
+                raise Exception(f"API request failed with status {response.status}")
 
-        # 최종 반환 데이터 검증
-        if isinstance(parsed_json, list) and all(isinstance(item, dict) for item in parsed_json):
-            return parsed_json
-        else:
-            raise ValueError("AI가 올바른 JSON 배열 형식(list of dicts)을 반환하지 않았습니다.")
-        
-    except Exception as e:
-        # st.error 대신 Exception을 발생시켜 app.py에서 처리하도록 위임
-        raise Exception(f"AI 질문 생성 중 오류 발생: {e}")
+            result = await response.json()
+            
+            # 2. Extract and Parse Text
+            json_text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text')
+            
+            if not json_text:
+                raise ValueError("API response contained no generated text.")
+
+            # The response is a JSON string due to responseMimeType
+            quiz_data = json.loads(json_text)
+            
+            # 3. Validate Data Structure
+            if not validate_quiz_data(quiz_data):
+                # If validation fails, it's likely a model generation error. Retry.
+                raise ValueError("Generated JSON failed structural validation.")
+            
+            print("Quiz generation successful.")
+            return quiz_data # Success!
+
+        except (Exception, ValueError) as e:
+            print(f"Attempt {attempt + 1} failed: {e}")
+            
+            if attempt < max_retries - 1:
+                # Calculate exponential backoff delay with jitter
+                delay = initial_delay * (2 ** attempt) + random.uniform(0, 1)
+                print(f"Retrying in {delay:.2f} seconds...")
+                await time.sleep(delay)
+            else:
+                print("Max retries reached. Failed to generate quiz.")
+                # Return a failure structure or re-raise
+                return {
+                    "title": f"Error Quiz: {topic}",
+                    "questions": [{"id": 1, "type": "short_answer", "question_text": "Failed to generate content.", "options": [], "correct_answer": ""}]
+                }
+
+    # Should not be reached if max_retries handles the final failure state
+    return {}
+    
+# Example of a dummy function for local testing (can be removed later)
+def test_quiz_generation():
+    print("This is a local test run of the utility.")
+    # Note: To actually test the API call, this would need to be run in an async environment.
+    # print(await generate_reflection_quiz("Climate Change Mitigation"))
+
+if __name__ == '__main__':
+    # This block executes if the file is run directly
+    print("Quiz Generator Utility Loaded.")
+    # test_quiz_generation()
